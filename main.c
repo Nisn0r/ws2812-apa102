@@ -3,8 +3,9 @@
 /* Prototypes */
 static void SystemClock_Config(void);
 static void WS2812_DecodeChunk(const uint16_t *chunk);
-static void APA102_AddPixel(uint8_t g, uint8_t r, uint8_t b);
-static void APA102_SendFrame(void);
+static void APA102_StartFrame(void);
+static void APA102_SendPixel(uint8_t g, uint8_t r, uint8_t b);
+static void APA102_EndFrame(uint32_t ledCount);
 
 /*
  * Decodage WS2812 via TIM3 en PWM Input Mode sur PA6 (TIM3_CH1) :
@@ -68,19 +69,28 @@ static void APA102_SendFrame(void);
 static uint16_t capture[WS2812_CAPTURE_LEN];
 
 /*
- * Trame APA102 pre-assemblee, emise en une fois par DMA sur SPI1 quand le
- * reset WS2812 marque la fin de la trame d'entree.
+ * Sortie APA102 : emission EN CONTINU, pixel par pixel, au fil du decodage.
+ *
+ * Contrairement au WS2812 (ou le bit est code par la duree du niveau haut, donc
+ * avec un timing strict), l'APA102 est cadence par sa propre horloge SCK : il
+ * n'y a AUCUNE contrainte de temps entre deux octets. On peut donc pousser
+ * chaque pixel des qu'il est decode, au lieu de bufferiser la trame entiere.
+ *
+ * Consequence : plus aucune limite sur le nombre de LEDs, et plus de gros
+ * buffer en RAM. Le nombre de pixels de la trame d'entree n'a pas besoin
+ * d'etre connu a l'avance.
  *
  * Format APA102 : start frame (32 bits a 0), puis 4 octets par LED
- * (0xE0|luminosite5bits, B, G, R), puis end frame (32 bits a 1).
+ * (0xE0|luminosite5bits, B, G, R), puis end frame.
  * Le WS2812 fournit G,R,B -> reordonnancement en B,G,R ici.
  */
-#define APA102_MAX_LEDS   64U
-#define APA102_FRAME_LEN  (4U + APA102_MAX_LEDS * 4U + 4U)
 #define APA102_BRIGHTNESS 0x1FU   /* 5 bits, 0x1F = maximum */
 
-static uint8_t  apaFrame[APA102_FRAME_LEN];
-static uint16_t apaLedCount = 0;
+/* frameActive : une start frame a ete emise, les pixels qui suivent lui
+   appartiennent. Reste a 0 tant qu'aucun reset WS2812 n'a ete vu, pour ne pas
+   emettre de pixels orphelins au demarrage (on ignore la trame en cours). */
+static uint8_t  frameActive = 0;
+static uint32_t ledCount    = 0;   /* LEDs emises dans la trame courante */
 
 /* Etat du decodage bit -> octet -> pixel */
 static uint8_t rxByte    = 0;
@@ -179,8 +189,9 @@ int main(void)
      * -> seul MOSI est utilise, l'APA102 n'a pas de ligne de retour).
      * SCK = PA1, MOSI = PA2 (AF0, broches 8 et 9 du TSSOP20, adjacentes) —
      * configure dans HAL_SPI_MspInit (stm32g0xx_hal_msp.c).
-     * fPCLK/16 = 4MHz : la trame de 60 LEDs (~248 octets) part en ~0.5ms,
-     * largement dans le temps d'une trame WS2812 (~1.8ms).
+     * fPCLK/8 = 8MHz : 4 octets (un pixel) partent en 4us, a comparer aux ~28us
+     * que dure un pixel WS2812. Pas de DMA en sortie : le FIFO 32 bits du SPI
+     * absorbe un pixel entier, l'ecriture est quasi non bloquante.
      * Mode 0 (CPOL=0, CPHA=0) : l'APA102 echantillonne sur front montant.
      */
     SPI_HandleTypeDef hspi1 = {0};
@@ -191,36 +202,17 @@ int main(void)
     hspi1.Init.CLKPolarity       = SPI_POLARITY_LOW;
     hspi1.Init.CLKPhase          = SPI_PHASE_1EDGE;
     hspi1.Init.NSS               = SPI_NSS_SOFT;
-    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
     hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
     hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
     hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
     HAL_SPI_Init(&hspi1);
 
-    /* BIDIOE : en half-duplex, forcer le sens sortie */
+    /* BIDIOE : en half-duplex, forcer le sens sortie.
+       Pas de TXDMAEN : les octets sont ecrits directement dans DR (voir
+       APA102_WriteByte), ce qui libere un canal DMA. */
     SPI1->CR1 |= SPI_CR1_BIDIOE;
-    SPI1->CR2 |= SPI_CR2_TXDMAEN;
     __HAL_SPI_ENABLE(&hspi1);
-
-    /* Canal DMA de la sortie SPI (arme a chaque trame par APA102_SendFrame) */
-    DMA_HandleTypeDef hdmaSpiTx = {0};
-    hdmaSpiTx.Instance                 = DMA1_Channel2;
-    hdmaSpiTx.Init.Request             = DMA_REQUEST_SPI1_TX;
-    hdmaSpiTx.Init.Direction           = DMA_MEMORY_TO_PERIPH;
-    hdmaSpiTx.Init.PeriphInc           = DMA_PINC_DISABLE;
-    hdmaSpiTx.Init.MemInc              = DMA_MINC_ENABLE;
-    hdmaSpiTx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
-    hdmaSpiTx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;
-    hdmaSpiTx.Init.Mode                = DMA_NORMAL;
-    hdmaSpiTx.Init.Priority            = DMA_PRIORITY_MEDIUM;
-    HAL_DMA_Init(&hdmaSpiTx);
-    DMA1_Channel2->CPAR = (uint32_t)&SPI1->DR;
-
-    /* Start frame APA102 : 32 bits a 0, ecrite une fois pour toutes */
-    apaFrame[0] = 0x00;
-    apaFrame[1] = 0x00;
-    apaFrame[2] = 0x00;
-    apaFrame[3] = 0x00;
 
     /* Seul CC2 declenche la rafale (CC1 n'a pas besoin de sa propre requete) */
     __HAL_TIM_ENABLE_DMA(&htim3, TIM_DMA_CC2);
@@ -262,11 +254,21 @@ static void WS2812_DecodeChunk(const uint16_t *chunk)
 
         if (period > WS2812_PERIOD_RESET)
         {
-            /* Reset : la trame precedente est complete, on l'emet et on repart */
-            APA102_SendFrame();
-            apaLedCount = 0;
-            bitCount = 0;
-            byteIndex = 0;
+            /* Reset : la trame precedente s'acheve. On la cloture (end frame),
+               puis on ouvre la suivante (start frame). Ce bit appartient deja
+               a la nouvelle trame. */
+            if (frameActive)
+                APA102_EndFrame(ledCount);
+
+            APA102_StartFrame();
+            frameActive = 1;
+            ledCount    = 0;
+            bitCount    = 0;
+            byteIndex   = 0;
+
+            /* Temoin : un pulse sur PA4 par trame */
+            GPIOA->ODR ^= GPIO_PIN_4;
+            GPIOA->ODR ^= GPIO_PIN_4;
         }
         else if (period > WS2812_PERIOD_NEW_PIXEL)
         {
@@ -295,59 +297,73 @@ static void WS2812_DecodeChunk(const uint16_t *chunk)
             if (++byteIndex == 3U)
             {
                 byteIndex = 0;
-                APA102_AddPixel(pixel[0], pixel[1], pixel[2]);
+                /* Pixel complet : emis immediatement, sans attendre la fin de
+                   la trame. Ignore tant qu'aucune start frame n'a ete emise. */
+                if (frameActive)
+                {
+                    APA102_SendPixel(pixel[0], pixel[1], pixel[2]);
+                    ledCount++;
+                }
             }
         }
     }
 }
 
 /**
-  * @brief Ajoute un pixel a la trame APA102 en cours d'assemblage.
-  *        Entree au format WS2812 (G, R, B), sortie au format APA102 (B, G, R).
+  * @brief Pousse un octet sur SPI1 vers l'APA102.
+  *
+  * L'ecriture DOIT etre un acces 8 bits : sur un acces 16/32 bits, le FIFO
+  * applique automatiquement le "data packing" (RM0454 27.5, section Data
+  * packing) et emettrait deux trames au lieu d'une.
+  *
+  * Le FIFO d'emission fait 32 bits, soit un pixel APA102 entier : l'attente sur
+  * TXE est en pratique tres courte.
   */
-static void APA102_AddPixel(uint8_t g, uint8_t r, uint8_t b)
+static inline void APA102_WriteByte(uint8_t value)
 {
-    if (apaLedCount >= APA102_MAX_LEDS)
-        return;   /* trame d'entree plus longue que prevu : on tronque */
-
-    uint8_t *led = &apaFrame[4U + apaLedCount * 4U];
-    led[0] = 0xE0U | APA102_BRIGHTNESS;   /* 3 bits de start + luminosite */
-    led[1] = b;
-    led[2] = g;
-    led[3] = r;
-    apaLedCount++;
+    while ((SPI1->SR & SPI_SR_TXE) == 0U)
+    {
+    }
+    *(volatile uint8_t *)&SPI1->DR = value;
 }
 
 /**
-  * @brief Termine la trame APA102 et la pousse sur SPI1 par DMA.
+  * @brief Start frame APA102 : 32 bits a 0.
   */
-static void APA102_SendFrame(void)
+static void APA102_StartFrame(void)
 {
-    if (apaLedCount == 0U)
-        return;
+    for (uint32_t i = 0; i < 4U; i++)
+        APA102_WriteByte(0x00U);
+}
 
-    /* Transfert precedent encore en cours : on saute cette trame plutot que
-       de corrompre l'emission (ne devrait pas arriver, ~0.5ms pour ~1.8ms). */
-    if (DMA1_Channel2->CNDTR != 0U)
-        return;
+/**
+  * @brief Emet un pixel. Entree au format WS2812 (G, R, B), sortie APA102
+  *        (0xE0|luminosite, B, G, R).
+  */
+static void APA102_SendPixel(uint8_t g, uint8_t r, uint8_t b)
+{
+    APA102_WriteByte(0xE0U | APA102_BRIGHTNESS);
+    APA102_WriteByte(b);
+    APA102_WriteByte(g);
+    APA102_WriteByte(r);
+}
 
-    uint32_t len = 4U + apaLedCount * 4U;
+/**
+  * @brief End frame APA102.
+  *
+  * Elle doit fournir au moins ledCount/2 coups d'horloge supplementaires pour
+  * propager les donnees jusqu'au bout de la chaine, soit ledCount/16 octets.
+  * Minimum 4 octets (32 bits), la valeur usuelle pour les chaines courtes.
+  */
+static void APA102_EndFrame(uint32_t ledCount_)
+{
+    uint32_t bytes = (ledCount_ + 15U) / 16U;
 
-    /* End frame : 32 bits a 1 */
-    apaFrame[len + 0U] = 0xFFU;
-    apaFrame[len + 1U] = 0xFFU;
-    apaFrame[len + 2U] = 0xFFU;
-    apaFrame[len + 3U] = 0xFFU;
-    len += 4U;
+    if (bytes < 4U)
+        bytes = 4U;
 
-    DMA1_Channel2->CCR  &= ~DMA_CCR_EN;
-    DMA1_Channel2->CMAR  = (uint32_t)apaFrame;
-    DMA1_Channel2->CNDTR = len;
-    DMA1_Channel2->CCR  |= DMA_CCR_EN;
-
-    /* Temoin : un pulse sur PA4 par trame emise */
-    GPIOA->ODR ^= GPIO_PIN_4;
-    GPIOA->ODR ^= GPIO_PIN_4;
+    while (bytes--)
+        APA102_WriteByte(0xFFU);
 }
 
 /**

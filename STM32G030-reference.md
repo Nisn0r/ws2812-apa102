@@ -305,8 +305,8 @@ seul domaine APB → **PCLK = 64 MHz** avec la configuration du projet.
   |---|---|---|
   | `000` | fPCLK/2 | 32 MHz |
   | `001` | fPCLK/4 | 16 MHz |
-  | `010` | fPCLK/8 | 8 MHz |
-  | `011` | **fPCLK/16** | **4 MHz** ← retenu pour l'APA102 |
+  | `010` | **fPCLK/8** | **8 MHz** ← retenu pour l'APA102 |
+  | `011` | fPCLK/16 | 4 MHz |
   | `100`…`111` | /32 … /256 | 2 MHz … 250 kHz |
 
 - `MSTR` (bit 2) — 1 = maître
@@ -322,14 +322,45 @@ seul domaine APB → **PCLK = 64 MHz** avec la configuration du projet.
 - `TXDMAEN` (bit 1) — « a DMA request is generated whenever the TXE flag is set »
 - `RXDMAEN` (bit 0) — idem sur RXNE
 
+### ⚠️ Data packing — piège sur l'écriture de `SPIx_DR`
+RM0454 §27.5, section *Data packing* :
+
+> « When the data frame size fits into one byte (less than or equal to 8 bits),
+> data packing is used **automatically when any read or write 16-bit access is
+> performed** on the SPIx_DR register. […] **Two data frames are sent** after the
+> single 16-bit access. »
+
+Autrement dit, avec `DS = 8 bits`, la largeur de l'accès C détermine le nombre de
+trames émises :
+
+```c
+*(volatile uint8_t *)&SPI1->DR = value;   /* OK  — 1 octet emis */
+SPI1->DR = value;                         /* NON — accès 32 bits : data packing,
+                                             2 trames émises */
+```
+
+Le champ `DR` étant déclaré `__IO uint32_t` dans le CMSIS, l'écriture naïve est
+un accès 32 bits : **le cast 8 bits est obligatoire**. Symptôme sinon : chaque
+octet est émis en double.
+
+Le RM ajoute que pour une séquence d'un nombre **impair** de trames, il suffit
+d'écrire la dernière en accès 8 bits.
+
+### FIFO d'émission
+32 bits, soit **4 octets** en mode 8 bits — exactement la taille d'une trame LED
+APA102. `TXE` signale que le FIFO a de la place ; l'écriture d'un pixel entier
+est donc quasi non bloquante, ce qui permet de se passer de DMA en sortie.
+
 ### Entrées DMAMUX
 `SPI1_RX` = 16, **`SPI1_TX` = 17**, `SPI2_RX` = 18, `SPI2_TX` = 19.
+(Non utilisées actuellement : la sortie APA102 écrit directement dans `DR`.)
 
-### Débit nécessaire pour ce projet
-Une trame de 60 LEDs APA102 = 4 (start) + 60 × 4 + 4 (end) = **248 octets**.
-À 4 MHz : ~0,5 ms, alors qu'une trame WS2812 de 60 pixels dure
-60 × 24 × 1,17 µs ≈ **1,7 ms**. Large marge, la sortie se termine bien avant
-l'arrivée de la trame suivante.
+### Débit dans ce projet
+Émission **en continu**, pixel par pixel : 4 octets à 8 MHz = **4 µs**, à
+comparer aux ~28 µs que dure un pixel WS2812 en entrée. L'APA102 n'ayant aucune
+contrainte de temps entre octets (il est cadencé par SCK, contrairement au
+WS2812 dont le bit est codé par une durée), rien n'oblige à bufferiser la trame
+entière — et le nombre de LEDs n'a donc pas à être connu à l'avance.
 
 ---
 

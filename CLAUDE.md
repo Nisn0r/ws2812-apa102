@@ -38,14 +38,18 @@ Toute la configuration (GPIO, TIM3, DMA, SPI) est faite directement dans `main()
 locales à `main()`, valides tant que `main()` ne retourne pas (jamais).
 
 ```
-WS2812 (PA6) ─► TIM3 PWM Input Mode ─► DMA1_CH1 (burst) ─► capture[]
+WS2812 (PA6) ─► TIM3 PWM Input Mode ─► DMA1_CH1 (burst) ─► capture[]  (ping-pong)
                                                               │
                                                       décodage logiciel
+                                                     (boucle while(1), sans IRQ)
                                                               │
-                                                          apaFrame[]
+                                                   pixel complet, au fil de l'eau
                                                               │
-                                          DMA1_CH2 ─► SPI1 ─► APA102 (PA1/PA2)
+                                                    SPI1 ─► APA102 (PA1/PA2)
 ```
+
+Un seul canal DMA est utilisé (capture). La sortie se fait par écriture directe
+dans `SPI1->DR`, sans DMA ni buffer de trame.
 
 ### 1. Capture — TIM3 en PWM Input Mode, entrée PA6
 - **PA6** = `TIM3_CH1` en AF1. PA0 avait été envisagé puis écarté : aucune
@@ -81,25 +85,49 @@ Un chunk **n'est pas aligné sur un pixel**, et n'a pas à l'être : c'est la
 resynchronisation sur période allongée qui place les frontières.
 
 Règles de décodage (`WS2812_DecodeChunk`) :
-- `période > WS2812_PERIOD_RESET` → fin de trame : on émet la trame APA102 et on
-  repart à zéro.
+- `période > WS2812_PERIOD_RESET` → fin de trame : `APA102_EndFrame()` clôture la
+  trame précédente, `APA102_StartFrame()` ouvre la suivante. Le bit courant
+  appartient déjà à la nouvelle trame.
 - `période > WS2812_PERIOD_NEW_PIXEL` → séparateur inter-pixel ou inter-triplet :
   ce bit ouvre un nouveau pixel. **C'est ce mécanisme qui resynchronise la trame**
   et corrige toute dérive, plutôt qu'un comptage modulo 24 qui dériverait
   silencieusement.
 - `période < WS2812_PERIOD_MIN` → glitch, capture ignorée.
-- 8 bits → `pixel[byteIndex]` (0=G, 1=R, 2=B) ; 3 octets → `APA102_AddPixel`.
+- 8 bits → `pixel[byteIndex]` (0=G, 1=R, 2=B) ; 3 octets → `APA102_SendPixel()`,
+  émis immédiatement.
 
-### 4. Sortie — SPI1 + DMA1 canal 2
+### 4. Sortie — SPI1, émission **en continu**, sans DMA ni buffer
 - **SCK = PA1, MOSI = PA2** (AF0, broches 8 et 9 du TSSOP20, adjacentes).
 - **Half-duplex émission seule** (`BIDIMODE`/`BIDIOE`) : l'APA102 n'a pas de
   ligne de retour, et surtout `SPI1_MISO` tombe sur **PA6**, déjà pris par
   l'entrée WS2812.
-- fPCLK/16 = 4 MHz. Une trame de 60 LEDs (248 octets) part en ~0,5 ms, contre
-  ~1,7 ms de trame WS2812 : large marge.
-- La trame est assemblée au fil du décodage puis poussée **entière** par DMA
-  quand le reset WS2812 est détecté. Réordonnancement G,R,B → B,G,R.
-- Témoin : un pulse sur **PA4** (LED) par trame émise.
+- fPCLK/8 = **8 MHz**. Un pixel (4 octets) part en 4 µs, contre ~28 µs que dure
+  un pixel WS2812.
+
+**Pourquoi le streaming est possible ici** : contrairement au WS2812 — où la
+valeur du bit est codée par une *durée*, donc avec un timing strict — l'APA102
+est cadencé par sa propre horloge SCK. Il n'y a **aucune contrainte de temps
+entre deux octets** : on peut pousser un pixel, attendre 30 µs, pousser le
+suivant. D'où :
+- **aucune limite sur le nombre de LEDs**, et pas besoin de le connaître à
+  l'avance (il n'est pas connu sur ce montage) ;
+- **pas de buffer de trame** en RAM ;
+- **pas de canal DMA** en sortie — le FIFO 32 bits du SPI vaut exactement un
+  pixel APA102, l'attente sur `TXE` est marginale.
+
+Séquence : start frame (32 bits à 0) au reset → chaque pixel dès qu'il est
+décodé → end frame au reset suivant. `frameActive` empêche d'émettre des pixels
+orphelins au démarrage, tant qu'aucun reset n'a été vu.
+
+L'**end frame est calculée** : `ledCount/16` octets (la spec demande au moins
+n/2 coups d'horloge pour propager les données au bout de la chaîne), minimum 4.
+Elle s'adapte donc seule à la longueur réelle.
+
+⚠️ **`SPI1->DR` doit être écrit en accès 8 bits** (`*(volatile uint8_t *)&SPI1->DR`).
+Un accès 16/32 bits déclenche le *data packing* du FIFO et émet **deux** trames.
+Voir référence §8.
+
+- Témoin : un pulse sur **PA4** (LED) par trame.
 
 ## Seuils WS2812 — issus de relevés réels, pas des valeurs nominales
 Mesurés à l'oscillo et dans le buffer, sur le contrôleur utilisé (tick = 15,6 ns) :
@@ -125,12 +153,16 @@ pixels par **3** et envoie ~60 pixels avant reset.
   au débogueur (buffer régulier, pulse PA4 stable).
 - **Ordre des octets APA102** (`0xE0|luminosité, B, G, R`) écrit de mémoire, pas
   depuis un datasheet relu. Si les couleurs sortent permutées, c'est dans
-  `APA102_AddPixel`.
+  `APA102_SendPixel`.
 - **Reset > 1,02 ms** : le compteur 16 bits sans prescaler reboucle au-delà, un
   gap trop long serait lu comme une valeur faussement petite. Non observé ;
   parade = `Prescaler = 1` (cf. référence §10).
-- **`APA102_MAX_LEDS = 64`** : au-delà, les pixels sont silencieusement tronqués.
-  Le nombre réel de pixels par trame n'a pas été compté précisément (~60).
+- **Chaînes très longues** : le reset est détecté sur le *premier bit de la trame
+  suivante*, donc end frame + start frame sont émises pendant que la nouvelle
+  trame défile déjà. À ~60 LEDs cela fait 8 octets = 8 µs, très en deçà des 28 µs
+  d'un pixel. Mais vers 500 LEDs l'end frame atteint ~32 octets (~32 µs) et
+  dépasserait le budget d'un chunk, avec risque de retard sur le buffer de
+  capture. Dans ce cas, repasser la sortie en DMA.
 
 ---
 
