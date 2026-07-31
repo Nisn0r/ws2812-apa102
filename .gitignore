@@ -1,0 +1,13 @@
+# Artefacts de compilation (régénérés par `make`)
+/build/
+.claude/settings.local.json
+.vscode/
+
+# Dump du firmware d'usine de la carte : binaire tiers, non régénérable et sans
+# rapport avec le code source. Hors dépôt public.
+factory_firmware.bin
+
+# Divers
+*.swp
+*~
+.DS_Store
