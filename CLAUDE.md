@@ -37,19 +37,32 @@ Toute la configuration (GPIO, TIM3, DMA, SPI) est faite directement dans `main()
 — pas de fonctions `MX_*_Init` séparées ; les handles HAL sont des variables
 locales à `main()`, valides tant que `main()` ne retourne pas (jamais).
 
-```
-WS2812 (PA6) ─► TIM3 PWM Input Mode ─► DMA1_CH1 (burst) ─► capture[]  (ping-pong)
-                                                              │
-                                                      décodage logiciel
-                                                     (boucle while(1), sans IRQ)
-                                                              │
-                                                   pixel complet, au fil de l'eau
-                                                              │
-                                                    SPI1 ─► APA102 (PA1/PA2)
+```mermaid
+flowchart LR
+    subgraph HW["Matériel — autonome, aucune intervention CPU par bit"]
+        direction LR
+        WS["Signal WS2812<br/>entrée PA6"]
+        TIM["TIM3 — PWM Input Mode<br/>CCR1 = période<br/>CCR2 = largeur du niveau haut"]
+        DMA["DMA1 canal 1<br/>mode burst via DMAR"]
+        BUF[("capture[]<br/>circulaire ping-pong<br/>2 × 24 bits")]
+        WS --> TIM
+        TIM -->|"1 requête CC2<br/>= rafale de 2 transferts"| DMA
+        DMA --> BUF
+    end
+
+    subgraph SW["Logiciel — boucle while(1), sans aucune IRQ"]
+        direction LR
+        DEC["WS2812_DecodeChunk<br/>bit → octet → pixel<br/>resync sur période longue"]
+        OUT["APA102_SendPixel<br/>écriture 8 bits dans SPI1 DR"]
+        DEC -->|"pixel complet G,R,B"| OUT
+    end
+
+    BUF -->|"flags Half Transfer / Transfer Complete"| DEC
+    OUT --> APA["APA102<br/>PA1 = SCK, PA2 = MOSI"]
 ```
 
-Un seul canal DMA est utilisé (capture). La sortie se fait par écriture directe
-dans `SPI1->DR`, sans DMA ni buffer de trame.
+Un **seul canal DMA** est utilisé, pour la capture. La sortie se fait par
+écriture directe dans `SPI1->DR` : ni DMA, ni buffer de trame.
 
 ### 1. Capture — TIM3 en PWM Input Mode, entrée PA6
 - **PA6** = `TIM3_CH1` en AF1. PA0 avait été envisagé puis écarté : aucune
